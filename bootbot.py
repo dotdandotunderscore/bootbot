@@ -13,6 +13,7 @@ GOLD = int(os.getenv("GOLD"))
 BROWN = int(os.getenv("BROWN"))
 GOLD_BOARD_ID = int(os.getenv("GOLD_BOARD_ID"))
 BROWN_BOARD_ID = int(os.getenv("BROWN_BOARD_ID"))
+MIN_COUNT = int(os.getenv("MIN_COUNT", 3))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -79,7 +80,7 @@ def get_message_link(payload):
     )
 
 
-def get_starboard_updates(message, min_count=3):
+def get_starboard_updates(message, min_count=MIN_COUNT):
     """Check reactions and return list of (channel, emoji, count) tuples for starboard updates"""
     updates = []
     for reaction in message.reactions:
@@ -124,7 +125,7 @@ async def on_raw_reaction_add(payload):
     channel = client.get_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
     message_link = get_message_link(payload)
-    updates = get_starboard_updates(message, min_count=3)
+    updates = get_starboard_updates(message, min_count=MIN_COUNT)
 
     for channel_to_post, emoji, count in updates:
         existing_message = await find_existing_starboard_message(channel_to_post, message_link)
@@ -153,8 +154,8 @@ async def on_raw_reaction_remove(payload):
         existing_message = await find_existing_starboard_message(channel_to_post, message_link)
 
         if existing_message and existing_message.author == client.user:
-            if count < 3:
-                # Remove message from starboard if count drops below 3
+            if count < MIN_COUNT:
+                # Remove message from starboard if count drops below MIN_COUNT
                 await existing_message.delete()
             else:
                 # Update existing message with new count
