@@ -22,6 +22,7 @@ intents.messages = True
 intents.members = True
 
 client = discord.Client(intents=intents)
+JACK = 72830485927043072
 
 
 async def create_starboard_embeds(message: discord.Message):
@@ -129,6 +130,9 @@ async def on_raw_reaction_add(payload):
     message_link = get_message_link(payload)
     updates = get_starboard_updates(message, min_count=MIN_COUNT)
 
+    if existing_message.author == JACK:
+        return
+        
     for channel_to_post, emoji, count in updates:
         existing_message = await find_existing_starboard_message(channel_to_post, message_link)
 
@@ -147,6 +151,7 @@ async def on_raw_reaction_remove(payload):
     if payload.channel_id in [GOLD_BOARD_ID, BROWN_BOARD_ID]:
         return
 
+    
     channel = client.get_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
     message_link = get_message_link(payload)
