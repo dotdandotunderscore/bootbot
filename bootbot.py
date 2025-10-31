@@ -114,8 +114,6 @@ async def find_existing_starboard_message(channel, message_link, limit=100):
 
 @client.event
 async def on_ready():
-    with open("bootbot.png", "rb") as f:
-        await client.user.edit(avatar=f.read())
     print(f"We have logged in as {client.user}")
 
 
@@ -128,6 +126,10 @@ async def on_raw_reaction_add(payload):
     message = await channel.fetch_message(payload.message_id)
     message_link = get_message_link(payload)
     updates = get_starboard_updates(message, min_count=MIN_COUNT)
+
+    if payload.message_author_id == payload.user_id and payload.emoji.id in [GOLD, BROWN]:
+        await message.remove_reaction(payload.emoji, client.get_user(payload.user_id))
+        return
 
     for channel_to_post, emoji, count in updates:
         existing_message = await find_existing_starboard_message(channel_to_post, message_link)
