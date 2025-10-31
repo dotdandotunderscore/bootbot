@@ -1,5 +1,3 @@
-# This example requires the 'message_content' intent.
-
 import os
 from pathlib import Path
 
@@ -116,6 +114,8 @@ async def find_existing_starboard_message(channel, message_link, limit=100):
 
 @client.event
 async def on_ready():
+    with open("bootbot.png", "rb") as f:
+        await client.user.edit(avatar=f.read())
     print(f"We have logged in as {client.user}")
 
 
