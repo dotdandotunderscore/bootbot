@@ -1,11 +1,13 @@
 # This example requires the 'message_content' intent.
 
 import os
+from pathlib import Path
 
 import discord
-from dotenv import load_dotenv
 
-load_dotenv()
+if Path(".env").exists():
+    from dotenv import load_dotenv
+    load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 GUILD = int(os.getenv("GUILD"))
