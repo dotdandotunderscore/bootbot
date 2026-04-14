@@ -18,6 +18,7 @@ MIN_COUNT = int(os.getenv("MIN_COUNT", 3))
 LEADERBOARD_CHANNEL_ID = int(os.getenv("LEADERBOARD_CHANNEL_ID"))
 LEADERBOARD_MESSAGE_ID = int(os.getenv("LEADERBOARD_MESSAGE_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID"))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -26,6 +27,7 @@ intents.messages = True
 intents.members = True
 
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
 db_pool: asyncpg.Pool = None
 
 
@@ -291,11 +293,54 @@ async def update_leaderboard():
     )
 
 
+# ── Slash commands ───────────────────────────────────────────────────────────
+
+@tree.command(
+    name="reset",
+    description="Wipe the database and clear all starboard channels",
+    guild=discord.Object(id=GUILD),
+)
+async def reset_command(interaction: discord.Interaction):
+    # Check for admin role
+    has_role = any(
+        r.id == ADMIN_ROLE_ID for r in interaction.user.roles
+    )
+    if not has_role:
+        await interaction.response.send_message(
+            "You need the admin role to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Wipe the database
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM starboard_posts;")
+
+    # Purge bot messages from both starboard channels
+    gold_channel = client.get_channel(GOLD_BOARD_ID)
+    brown_channel = client.get_channel(BROWN_BOARD_ID)
+
+    for channel in [gold_channel, brown_channel]:
+        async for msg in channel.history(limit=None):
+            if msg.author == client.user:
+                await msg.delete()
+
+    # Reset the leaderboard message
+    await update_leaderboard()
+
+    await interaction.followup.send(
+        "All boards have been wiped.", ephemeral=True
+    )
+
+
 # ── Events ───────────────────────────────────────────────────────────────────
 
 @client.event
 async def on_ready():
     await init_db()
+    await tree.sync(guild=discord.Object(id=GUILD))
     print(f"We have logged in as {client.user}")
 
 
