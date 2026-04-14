@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import asyncpg
 import discord
 
 if Path(".env").exists():
@@ -16,6 +17,7 @@ BROWN_BOARD_ID = int(os.getenv("BROWN_BOARD_ID"))
 MIN_COUNT = int(os.getenv("MIN_COUNT", 3))
 LEADERBOARD_CHANNEL_ID = int(os.getenv("LEADERBOARD_CHANNEL_ID"))
 LEADERBOARD_MESSAGE_ID = int(os.getenv("LEADERBOARD_MESSAGE_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -24,7 +26,90 @@ intents.messages = True
 intents.members = True
 
 client = discord.Client(intents=intents)
+db_pool: asyncpg.Pool = None
 
+
+# ── Database helpers ─────────────────────────────────────────────────────────
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS starboard_posts (
+                message_id BIGINT NOT NULL,
+                author_id  BIGINT NOT NULL,
+                emoji_type TEXT NOT NULL CHECK (emoji_type IN ('gold', 'brown')),
+                reaction_count INT NOT NULL DEFAULT 0,
+                PRIMARY KEY (message_id, emoji_type)
+            );
+        """)
+
+
+async def upsert_post(message_id: int, author_id: int, emoji_type: str, count: int):
+    """Insert or update a starboard post's reaction count."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO starboard_posts (message_id, author_id, emoji_type, reaction_count)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (message_id, emoji_type)
+            DO UPDATE SET reaction_count = $4;
+        """, message_id, author_id, emoji_type, count)
+
+
+async def delete_post(message_id: int, emoji_type: str):
+    """Remove a post from the starboard tracking."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM starboard_posts WHERE message_id = $1 AND emoji_type = $2;",
+            message_id, emoji_type,
+        )
+
+
+async def get_leaderboard(emoji_type: str):
+    """Return leaderboard rows: [(author_id, posts, total_emojis), ...]"""
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT author_id,
+                   COUNT(*)::int           AS posts,
+                   SUM(reaction_count)::int AS total_emojis
+            FROM starboard_posts
+            WHERE emoji_type = $1
+            GROUP BY author_id
+            ORDER BY total_emojis DESC;
+        """, emoji_type)
+
+
+async def get_ratio_leaderboard():
+    """Return ratio rows for users on BOTH boards.
+
+    Ratio = (avg gold per post) / (avg brown per post).
+    Only includes users with at least one post on each board.
+    """
+    async with db_pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT
+                g.author_id,
+                g.avg_gold,
+                b.avg_brown,
+                (g.avg_gold / b.avg_brown) AS ratio
+            FROM (
+                SELECT author_id,
+                       AVG(reaction_count)::float AS avg_gold
+                FROM starboard_posts WHERE emoji_type = 'gold'
+                GROUP BY author_id
+            ) g
+            JOIN (
+                SELECT author_id,
+                       AVG(reaction_count)::float AS avg_brown
+                FROM starboard_posts WHERE emoji_type = 'brown'
+                GROUP BY author_id
+            ) b ON g.author_id = b.author_id
+            ORDER BY ratio DESC;
+        """)
+
+
+# ── Discord helpers ──────────────────────────────────────────────────────────
 
 async def create_starboard_embeds(message: discord.Message):
     """Create embed(s) - returns a list with replied-to message first if applicable"""
@@ -38,7 +123,7 @@ async def create_starboard_embeds(message: discord.Message):
 
         replied_embed = discord.Embed(
             description=replied_content,
-            color=discord.Color.greyple(),  # Different color to distinguish
+            color=discord.Color.greyple(),
             timestamp=replied_to.created_at,
         )
 
@@ -46,7 +131,6 @@ async def create_starboard_embeds(message: discord.Message):
             name=replied_to.author.display_name, icon_url=replied_to.author.display_avatar.url
         )
 
-        # Add image if present
         if replied_to.attachments:
             attachment = replied_to.attachments[0]
             if attachment.content_type and attachment.content_type.startswith("image"):
@@ -54,7 +138,6 @@ async def create_starboard_embeds(message: discord.Message):
 
         embeds.append(replied_embed)
 
-    # Create the embed for the actual message
     content = message.system_content or None
 
     embed = discord.Embed(
@@ -63,7 +146,6 @@ async def create_starboard_embeds(message: discord.Message):
 
     embed.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
 
-    # Add image if present
     if message.attachments:
         attachment = message.attachments[0]
         if attachment.content_type and attachment.content_type.startswith("image"):
@@ -114,170 +196,102 @@ async def find_existing_starboard_message(channel, message_link, limit=100):
     return None
 
 
-def parse_leaderboard_embed(embed):
-    """Parse an embed to extract user stats from the table"""
-    stats = {}
-    if not embed.description or embed.description == "*No entries yet!*":
-        return stats
+# ── Leaderboard rendering ───────────────────────────────────────────────────
 
-    # Parse the table in the embed description
-    lines = embed.description.strip('`').split('\n')
-    for line in lines[2:]:  # Skip header and separator
-        line = line.strip()
-        if line and line != '```' and not line.startswith('-'):
-            try:
-                # Split by whitespace, format: rank username posts total
-                parts = line.split()
-                if len(parts) >= 4:
-                    total = int(parts[-1])
-                    posts = int(parts[-2])
-                    # Username is everything between rank and the last two numbers
-                    username = ' '.join(parts[1:-2])
+async def update_leaderboard():
+    """Rebuild and post the leaderboard from the database."""
 
-                    stats[username] = {'posts': posts, 'total_emojis': total}
-            except (ValueError, IndexError):
-                continue
-    return stats
-
-
-async def update_leaderboard(user_id, emoji_id, new_count, old_count=None, is_new_post=False):
-    """Update leaderboard message incrementally based on a change to the starboard.
-
-    Args:
-        user_id: The author of the message that was added/updated/removed
-        emoji_id: GOLD or BROWN emoji ID to know which board changed
-        new_count: Current reaction count (0 means removed from board)
-        old_count: Previous reaction count (for updates)
-        is_new_post: True if this is a new post being added to the board
-    """
-
-    # Get the leaderboard channel and message
     leaderboard_channel = client.get_channel(LEADERBOARD_CHANNEL_ID)
     leaderboard_message = await leaderboard_channel.fetch_message(LEADERBOARD_MESSAGE_ID)
 
     guild = client.get_guild(GUILD)
-
-    # Parse existing leaderboard embeds to get current stats
-    gold_stats = {}  # user_id -> {'posts': count, 'total_emojis': count}
-    brown_stats = {}
-
-    if leaderboard_message.embeds:
-        # Map existing stats from embeds (keyed by username)
-        if len(leaderboard_message.embeds) > 0:
-            gold_stats_by_name = parse_leaderboard_embed(
-                leaderboard_message.embeds[0]
-            )
-        else:
-            gold_stats_by_name = {}
-
-        if len(leaderboard_message.embeds) > 1:
-            brown_stats_by_name = parse_leaderboard_embed(
-                leaderboard_message.embeds[1]
-            )
-        else:
-            brown_stats_by_name = {}
-
-        # Convert username-based stats to user_id-based stats
-        for member in guild.members:
-            username = member.display_name[:16]
-            if username in gold_stats_by_name:
-                gold_stats[member.id] = gold_stats_by_name[username]
-            if username in brown_stats_by_name:
-                brown_stats[member.id] = brown_stats_by_name[username]
-
-    # Determine which board to update
-    target_stats = gold_stats if emoji_id == GOLD else brown_stats
-
-    # Initialize user stats if they don't exist
-    if user_id not in target_stats:
-        target_stats[user_id] = {'posts': 0, 'total_emojis': 0}
-
-    # Apply the incremental update
-    if is_new_post:
-        # New post added to board (just hit MIN_COUNT threshold)
-        target_stats[user_id]['posts'] += 1
-        target_stats[user_id]['total_emojis'] += new_count
-    elif new_count == 0:
-        # Post removed from board (dropped below MIN_COUNT)
-        target_stats[user_id]['posts'] -= 1
-        target_stats[user_id]['total_emojis'] -= old_count if old_count else 0
-        # Remove user from stats if they have no posts
-        if target_stats[user_id]['posts'] <= 0:
-            del target_stats[user_id]
-    else:
-        # Post updated (reaction added or removed, but still on board)
-        delta = new_count - (old_count if old_count else new_count - 1)
-        target_stats[user_id]['total_emojis'] += delta
-
-    # Get guild and emojis
     gold_emoji = discord.utils.get(guild.emojis, id=GOLD)
     brown_emoji = discord.utils.get(guild.emojis, id=BROWN)
 
-    # Sort by total emojis (descending)
-    gold_sorted = sorted(gold_stats.items(), key=lambda x: x[1]['total_emojis'], reverse=True)
-    brown_sorted = sorted(brown_stats.items(), key=lambda x: x[1]['total_emojis'], reverse=True)
-
-    # Build embed for gold board
+    # ── Gold embed ───────────────────────────────────────────────────────
+    gold_rows = await get_leaderboard("gold")
     gold_embed = discord.Embed(
         title=f"{gold_emoji} Parkour Master Board",
-        color=discord.Color.gold()
+        color=discord.Color.gold(),
     )
 
-    if gold_sorted:
-        # Build table as field value
+    if gold_rows:
         table = "```\n"
         table += f"{'#':<4}{'User':<18}{'Posts':<7}{'Total':<7}\n"
         table += "-" * 36 + "\n"
-
-        for rank, (uid, stats) in enumerate(gold_sorted, 1):
+        for rank, row in enumerate(gold_rows, 1):
             try:
-                user = await guild.fetch_member(uid)
-                username = user.display_name[:16]
-                table += (
-                    f"{rank:<4}{username:<18}"
-                    f"{stats['posts']:<7}{stats['total_emojis']:<7}\n"
-                )
+                member = await guild.fetch_member(row["author_id"])
+                username = member.display_name[:16]
             except (discord.errors.NotFound, discord.errors.HTTPException):
                 continue
-
+            table += f"{rank:<4}{username:<18}{row['posts']:<7}{row['total_emojis']:<7}\n"
         table += "```"
         gold_embed.description = table
     else:
         gold_embed.description = "*No entries yet!*"
 
-    # Build embed for brown board
+    # ── Brown embed ──────────────────────────────────────────────────────
+    brown_rows = await get_leaderboard("brown")
     brown_embed = discord.Embed(
         title=f"{brown_emoji} Parkour Noob Board",
-        color=0x8B4513  # Brown color
+        color=0x8B4513,
     )
 
-    if brown_sorted:
+    if brown_rows:
         table = "```\n"
         table += f"{'#':<4}{'User':<18}{'Posts':<7}{'Total':<7}\n"
         table += "-" * 36 + "\n"
-
-        for rank, (uid, stats) in enumerate(brown_sorted, 1):
+        for rank, row in enumerate(brown_rows, 1):
             try:
-                user = await guild.fetch_member(uid)
-                username = user.display_name[:16]
-                table += (
-                    f"{rank:<4}{username:<18}"
-                    f"{stats['posts']:<7}{stats['total_emojis']:<7}\n"
-                )
+                member = await guild.fetch_member(row["author_id"])
+                username = member.display_name[:16]
             except (discord.errors.NotFound, discord.errors.HTTPException):
                 continue
-
+            table += f"{rank:<4}{username:<18}{row['posts']:<7}{row['total_emojis']:<7}\n"
         table += "```"
         brown_embed.description = table
     else:
         brown_embed.description = "*No entries yet!*"
 
-    # Update the leaderboard message with embeds
-    await leaderboard_message.edit(content="# Leaderboard", embeds=[gold_embed, brown_embed])
+    # ── Ratio embed ──────────────────────────────────────────────────────
+    ratio_rows = await get_ratio_leaderboard()
+    ratio_embed = discord.Embed(
+        title=f"{gold_emoji}/{brown_emoji} Master-to-Noob Ratio",
+        color=discord.Color.blue(),
+    )
 
+    if ratio_rows:
+        table = "```\n"
+        table += f"{'#':<4}{'User':<16}{'AvgG':<7}{'AvgB':<7}{'Ratio':<7}\n"
+        table += "-" * 41 + "\n"
+        for rank, row in enumerate(ratio_rows, 1):
+            try:
+                member = await guild.fetch_member(row["author_id"])
+                username = member.display_name[:14]
+            except (discord.errors.NotFound, discord.errors.HTTPException):
+                continue
+            table += (
+                f"{rank:<4}{username:<16}"
+                f"{row['avg_gold']:<7.1f}{row['avg_brown']:<7.1f}"
+                f"{row['ratio']:<7.2f}\n"
+            )
+        table += "```"
+        ratio_embed.description = table
+    else:
+        ratio_embed.description = "*Need entries on both boards!*"
+
+    await leaderboard_message.edit(
+        content="# Leaderboard",
+        embeds=[gold_embed, brown_embed, ratio_embed],
+    )
+
+
+# ── Events ───────────────────────────────────────────────────────────────────
 
 @client.event
 async def on_ready():
+    await init_db()
     print(f"We have logged in as {client.user}")
 
 
@@ -296,28 +310,21 @@ async def on_raw_reaction_add(payload):
         return
 
     for channel_to_post, emoji, count in updates:
+        emoji_type = "gold" if emoji.id == GOLD else "brown"
         existing_message = await find_existing_starboard_message(channel_to_post, message_link)
 
         if existing_message and existing_message.author == client.user:
-            # Update existing message with new count
-            # Extract old count from existing message
-            old_count = int(existing_message.content.split('**')[1])
             new_content = f"{emoji} **{count}** | {message_link}"
             await existing_message.edit(content=new_content)
-            await update_leaderboard(
-                message.author.id, emoji.id, count,
-                old_count=old_count, is_new_post=False
-            )
         else:
-            # Post new message to starboard
             embeds = await create_starboard_embeds(message)
             await channel_to_post.send(
                 f"{emoji} **{count}** | {message_link}",
-                embeds=embeds
+                embeds=embeds,
             )
-            await update_leaderboard(
-                message.author.id, emoji.id, count, is_new_post=True
-            )
+
+        await upsert_post(payload.message_id, message.author.id, emoji_type, count)
+        await update_leaderboard()
 
 
 @client.event
@@ -331,27 +338,19 @@ async def on_raw_reaction_remove(payload):
     updates = get_starboard_updates(message, min_count=0)
 
     for channel_to_post, emoji, count in updates:
+        emoji_type = "gold" if emoji.id == GOLD else "brown"
         existing_message = await find_existing_starboard_message(channel_to_post, message_link)
 
         if existing_message and existing_message.author == client.user:
-            # Extract old count from existing message
-            old_count = int(existing_message.content.split('**')[1])
-
             if count < MIN_COUNT:
-                # Remove message from starboard if count drops below MIN_COUNT
                 await existing_message.delete()
-                await update_leaderboard(
-                    message.author.id, emoji.id, 0,
-                    old_count=old_count, is_new_post=False
-                )
+                await delete_post(payload.message_id, emoji_type)
             else:
-                # Update existing message with new count
                 new_content = f"{emoji} **{count}** | {message_link}"
                 await existing_message.edit(content=new_content)
-                await update_leaderboard(
-                    message.author.id, emoji.id, count,
-                    old_count=old_count, is_new_post=False
-                )
+                await upsert_post(payload.message_id, message.author.id, emoji_type, count)
+
+            await update_leaderboard()
 
 
 client.run(TOKEN)
