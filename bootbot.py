@@ -263,17 +263,21 @@ async def update_leaderboard():
 
     if ratio_rows:
         table = "```\n"
-        table += f"{'#':<4}{'User':<16}{'AvgG':<7}{'AvgB':<7}{'Ratio':<7}\n"
-        table += "-" * 41 + "\n"
+        table += f"{'#':<4}{'User':<18}{'Ratio':<7}\n"
+        table += "-" * 29 + "\n"
         for rank, row in enumerate(ratio_rows, 1):
             try:
-                member = await guild.fetch_member(row["author_id"])
-                username = member.display_name[:14]
-            except (discord.errors.NotFound, discord.errors.HTTPException):
+                member = await guild.fetch_member(
+                    row["author_id"]
+                )
+                username = member.display_name[:16]
+            except (
+                discord.errors.NotFound,
+                discord.errors.HTTPException,
+            ):
                 continue
             table += (
-                f"{rank:<4}{username:<16}"
-                f"{row['avg_gold']:<7.1f}{row['avg_brown']:<7.1f}"
+                f"{rank:<4}{username:<18}"
                 f"{row['ratio']:<7.2f}\n"
             )
         table += "```"
@@ -332,25 +336,55 @@ async def on_raw_reaction_remove(payload):
     if payload.channel_id in [GOLD_BOARD_ID, BROWN_BOARD_ID]:
         return
 
+    # Only handle gold/brown emoji removals
+    if not hasattr(payload.emoji, "id"):
+        return
+    if payload.emoji.id not in [GOLD, BROWN]:
+        return
+
     channel = client.get_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
     message_link = get_message_link(payload)
-    updates = get_starboard_updates(message, min_count=0)
 
-    for channel_to_post, emoji, count in updates:
-        emoji_type = "gold" if emoji.id == GOLD else "brown"
-        existing_message = await find_existing_starboard_message(channel_to_post, message_link)
+    guild = client.get_guild(GUILD)
+    if payload.emoji.id == GOLD:
+        board_channel = client.get_channel(GOLD_BOARD_ID)
+        emoji = discord.utils.get(guild.emojis, id=GOLD)
+        emoji_type = "gold"
+    else:
+        board_channel = client.get_channel(BROWN_BOARD_ID)
+        emoji = discord.utils.get(guild.emojis, id=BROWN)
+        emoji_type = "brown"
 
-        if existing_message and existing_message.author == client.user:
-            if count < MIN_COUNT:
-                await existing_message.delete()
-                await delete_post(payload.message_id, emoji_type)
-            else:
-                new_content = f"{emoji} **{count}** | {message_link}"
-                await existing_message.edit(content=new_content)
-                await upsert_post(payload.message_id, message.author.id, emoji_type, count)
+    # Find current count for this emoji (0 if fully removed)
+    count = 0
+    for reaction in message.reactions:
+        if hasattr(reaction.emoji, "id"):
+            if reaction.emoji.id == payload.emoji.id:
+                count = reaction.count
+                break
 
-            await update_leaderboard()
+    existing = await find_existing_starboard_message(
+        board_channel, message_link
+    )
+
+    if existing and existing.author == client.user:
+        if count < MIN_COUNT:
+            await existing.delete()
+            await delete_post(payload.message_id, emoji_type)
+        else:
+            new_content = (
+                f"{emoji} **{count}** | {message_link}"
+            )
+            await existing.edit(content=new_content)
+            await upsert_post(
+                payload.message_id,
+                message.author.id,
+                emoji_type,
+                count,
+            )
+
+        await update_leaderboard()
 
 
 client.run(TOKEN)
