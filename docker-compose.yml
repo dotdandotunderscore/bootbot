@@ -2,7 +2,7 @@ services:
   bootbot-db:
     image: postgres:18-alpine
     restart: unless-stopped
-    environment: ./bootbot-db/.env
+    environment: ./bootbot-db.env
     volumes:
       - ./data/bootbot-db:/var/lib/postgresql/data
     healthcheck:
@@ -12,9 +12,9 @@ services:
       retries: 5
     
   bootbot:
-    build: ./bootbot
+    build: .
     restart: unless-stopped
-    env_file: ./bootbot/.env
+    env_file: ./.env
     depends_on:
       bootbot-db:
         condition: service_healthy
