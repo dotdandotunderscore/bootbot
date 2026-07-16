@@ -1,5 +1,7 @@
 .venv
 .vscode
 .env
+.bootbot-db.env
+/data
 /psds
 /backups
