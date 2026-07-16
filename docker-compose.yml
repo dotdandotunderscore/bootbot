@@ -2,11 +2,11 @@ services:
   bootbot-db:
     image: postgres:18-alpine
     restart: unless-stopped
-    environment: ./bootbot-db.env
+    env_file: ./bootbot-db.env
     volumes:
-      - ./data/bootbot-db:/var/lib/postgresql/data
+      - ./data/bootbot-db:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bootbot"]
+      test: ["CMD-SHELL", "pg_isready -U bootbot -d bootbot-db"]
       interval: 5s
       timeout: 5s
       retries: 5
