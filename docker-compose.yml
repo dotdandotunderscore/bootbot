@@ -1,0 +1,20 @@
+services:
+  bootbot-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment: ./bootbot-db/.env
+    volumes:
+      - ./data/bootbot-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bootbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    
+  bootbot:
+    build: ./bootbot
+    restart: unless-stopped
+    env_file: ./bootbot/.env
+    depends_on:
+      bootbot-db:
+        condition: service_healthy
